@@ -11,11 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.config import AttentionConfig
 from vllm.model_executor.models.qwen3_dflash import (
     _dflash_layer_causal,
     _get_dflash_fc_input_size,
     dflash_has_any_non_causal,
 )
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -57,6 +59,25 @@ def test_dflash_layer_causal_is_per_layer():
     config = _config(2, layer_types=["sliding_attention", "full_attention"])
     assert _dflash_layer_causal(config, 0) is True
     assert _dflash_layer_causal(config, 1) is False
+
+
+def test_dflash_attention_config_only_overrides_causality():
+    target_model_config = object()
+    target_config = SimpleNamespace(
+        model_config=target_model_config,
+        attention_config=AttentionConfig(use_non_causal=False),
+    )
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.vllm_config = target_config
+    speculator.requires_non_causal = True
+
+    draft_config = speculator.attn_vllm_config
+
+    assert draft_config is not target_config
+    assert draft_config.model_config is target_model_config
+    assert target_config.model_config is target_model_config
+    assert draft_config.attention_config.use_non_causal is True
+    assert target_config.attention_config.use_non_causal is False
 
 
 def _vllm_config(**draft_config):
