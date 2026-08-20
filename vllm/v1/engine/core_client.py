@@ -1418,7 +1418,14 @@ class DPAsyncMPClient(AsyncMPClient):
 
         chosen_engine = self.get_core_engine_for_request(request)
         to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
-        if not self.engines_running:
+        kernel_config = self.vllm_config.kernel_config
+        parallel_config = self.vllm_config.parallel_config
+        require_megamoe_wake = (
+            kernel_config.moe_backend == "flashinfer_mega_moe"
+            and parallel_config.enable_expert_parallel
+            and parallel_config.data_parallel_size > 1
+        )
+        if not self.engines_running or require_megamoe_wake:
             # Notify coordinator that we're sending a request
             req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
             await self.first_req_send_socket.send(req_msg)

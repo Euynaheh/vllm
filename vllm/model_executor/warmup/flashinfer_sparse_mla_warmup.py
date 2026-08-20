@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Warmup and autotune helpers for FlashInfer sparse MLA backends."""
+import os
 
 from typing import TYPE_CHECKING, cast
 
@@ -221,6 +222,9 @@ def flashinfer_sparse_mla_decode_autotune_warmup(worker: "Worker") -> None:
 
 def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     """Warm DSv4 sparse-MLA mixed prefill+decode attention."""
+    if os.environ.get("VLLM_SKIP_DSV4_SPARSE_MLA_WARMUP") == "1":
+        logger.warning("Skipping DSv4 sparse-MLA mixed warmup by request.")
+        return
     runner = worker.model_runner
     if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
         return

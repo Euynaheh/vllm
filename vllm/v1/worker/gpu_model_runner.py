@@ -518,6 +518,11 @@ class GPUModelRunner(
         parallel_config = self.parallel_config
         self.device = device
         self.dtype = self.model_config.dtype
+        self.require_megamoe_ep_lockstep = (
+            vllm_config.kernel_config.moe_backend == "flashinfer_mega_moe"
+            and parallel_config.enable_expert_parallel
+            and parallel_config.data_parallel_size > 1
+        )
 
         self.check_ep_fault = False
         if parallel_config.data_parallel_size > 1 and self.model_config.is_moe:
@@ -4103,6 +4108,7 @@ class GPUModelRunner(
                     num_tokens_padded=num_tokens_padded,
                     uniform_decode=uniform_decode,
                     cudagraph_mode=cudagraph_mode.value,
+                    require_rank_lockstep=self.require_megamoe_ep_lockstep,
                 )
             )
 

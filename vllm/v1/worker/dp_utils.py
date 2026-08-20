@@ -104,6 +104,7 @@ def _synchronize_dp_ranks(
     should_attempt_ubatching: bool,
     cudagraph_mode: int,
     parallel_config: ParallelConfig,
+    require_rank_lockstep: bool = False,
 ) -> tuple[bool, torch.Tensor | None, int]:
     """
     1. Decides if each DP rank is going to microbatch. Either all ranks
@@ -149,7 +150,9 @@ def _synchronize_dp_ranks(
     # sizes across DP ranks currently).
     # Use the synced runtime cudagraph mode rather than the compilation config
     # so we can avoid padding when cudagraph is not enabled for this step.
-    should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
+    should_dp_pad = (
+        synced_cudagraph_mode != 0 or should_ubatch or require_rank_lockstep
+    )
 
     # Pad all DP ranks up to the maximum token count across ranks if
     # should_dp_pad is True
@@ -168,6 +171,7 @@ def coordinate_batch_across_dp(
     num_tokens_padded: int | None = None,
     uniform_decode: bool | None = None,
     cudagraph_mode: int = 0,
+    require_rank_lockstep: bool = False,
 ) -> tuple[bool, torch.Tensor | None, int]:
     """
     Coordinates amongst all DP ranks to determine if and how the full batch
@@ -183,6 +187,8 @@ def coordinate_batch_across_dp(
             only contains single token decodes
         cudagraph_mode: The cudagraph mode for this rank (0=NONE, 1=PIECEWISE, 2=FULL).
             DP padding is enabled when synced cudagraph mode across ranks is not NONE.
+        require_rank_lockstep: Force every rank to execute the same padded token
+            count. The existing all-reduce remains the only model-batch rendezvous.
 
     Returns: tuple[
         ubatch_slices: if this is set then all DP ranks have agreed to
@@ -219,6 +225,7 @@ def coordinate_batch_across_dp(
             should_attempt_ubatching,
             cudagraph_mode,
             parallel_config,
+            require_rank_lockstep=require_rank_lockstep,
         )
     )
 
