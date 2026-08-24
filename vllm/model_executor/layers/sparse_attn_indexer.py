@@ -35,6 +35,9 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.triton_fp8_paged_mqa_sm120 import (
+    fp8_paged_mqa_logits_sm120,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -563,7 +566,17 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_xpu():
+        if current_platform.is_device_capability_family(120):
+            assert padded_q_scale is None, "SM120 fallback supports FP8 Q only"
+            logits = fp8_paged_mqa_logits_sm120(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len,
+            )
+        elif current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -623,9 +636,21 @@ def sparse_attn_indexer(
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
             )
+            topk_seq_lens = seq_lens
+            if (
+                current_platform.is_device_capability_family(120)
+                and seq_lens.numel() == batch_size
+                and next_n > 1
+            ):
+                # The SM120 fallback emits one logits row per speculative slot.
+                # Non-spec decode metadata stores one shared length per batch;
+                # persistent_topk requires one length for every logits row.
+                topk_seq_lens = seq_lens.reshape(batch_size, 1).expand(
+                    batch_size, next_n
+                ).contiguous()
             torch.ops._C.persistent_topk(
                 logits,
-                seq_lens,
+                topk_seq_lens,
                 topk_indices,
                 topk_workspace,
                 topk_tokens,

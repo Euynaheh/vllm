@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -51,6 +52,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_input_scale,
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
+    deepgemm_post_process_fp8_weight_block,
     process_fp8_input_tensor_strategy_moe,
     process_fp8_weight_tensor_strategy,
     process_fp8_weight_tensor_strategy_moe,
@@ -81,6 +83,7 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
+    is_deep_gemm_e8m0_used,
     is_deep_gemm_supported,
 )
 
@@ -442,6 +445,37 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.input_scale = None
 
         self.fp8_linear.process_weights_after_loading(layer)
+
+        # DeepSeek-V4's wo_a is a grouped projection.  The Triton linear
+        # backend deliberately leaves its checkpoint tensors in ordinary 2-D
+        # block-FP8 layout, while the special output-projection DeepGEMM einsum
+        # needs a 3-D grouped weight and architecture-specific scale layout.
+        # Repack only that tagged layer when running the isolation experiment;
+        # every ordinary FP8 linear remains owned by the selected Triton kernel.
+        if (
+            os.getenv("VLLM_DSV4_WO_A_DEEP_GEMM", "0") == "1"
+            and getattr(layer, "is_bmm", False)
+        ):
+            assert self.block_quant
+            assert layer.weight_block_size is not None
+            scale_name = "weight_scale_inv"
+            weight_scale = getattr(layer, scale_name, None)
+            if weight_scale is None:
+                scale_name = "weight_scale"
+                weight_scale = layer.weight_scale
+            dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
+                wq=layer.weight,
+                ws=weight_scale,
+                quant_block_shape=tuple(layer.weight_block_size),
+                use_e8m0=is_deep_gemm_e8m0_used(),
+                is_bmm=True,
+                bmm_batch_size=layer.bmm_batch_size,
+            )
+            replace_parameter(layer, "weight", dg_weight)
+            replace_parameter(layer, scale_name, dg_weight_scale)
+            logger.info_once(
+                "Repacked DeepSeek-V4 wo_a for the isolated DeepGEMM einsum."
+            )
 
     def apply(
         self,

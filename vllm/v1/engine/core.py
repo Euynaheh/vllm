@@ -1862,6 +1862,23 @@ class DPEngineCoreProc(EngineCoreProc):
         scheduler_config = vllm_config.scheduler_config
         self.prefill_schedule_interval = scheduler_config.prefill_schedule_interval
 
+        parallel_config = vllm_config.parallel_config
+        self.require_megamoe_ep_lockstep = (
+            vllm_config.kernel_config.moe_backend == "flashinfer_mega_moe"
+            and parallel_config.enable_expert_parallel
+            and parallel_config.data_parallel_size > 1
+        )
+        self.finish_sync_interval = (
+            1 if self.require_megamoe_ep_lockstep else 32
+        )
+        self.profile_megamoe_finish_sync = (
+            self.require_megamoe_ep_lockstep
+            and os.getenv("VLLM_MEGAMOE_PROFILE_FINISH_SYNC", "0") == "1"
+        )
+        self.finish_sync_calls = 0
+        self.finish_sync_total_ns = 0
+        self.finish_sync_max_ns = 0
+
         # Counts forward-passes of the model so that we can synchronize
         # finished with DP peers every N steps.
         self.step_counter = 0
@@ -1934,15 +1951,16 @@ class DPEngineCoreProc(EngineCoreProc):
 
     def add_request(self, request: Request, request_wave: int = 0):
         super().add_request(request, request_wave)
-        if self.has_coordinator and request_wave != self.current_wave:
+        if self.has_coordinator:
             if request_wave > self.current_wave:
                 self.current_wave = request_wave
-            elif (
+            if (
                 not self.engines_running
                 and self.scheduler.pause_state == PauseState.UNPAUSED
             ):
-                # Request received for an already-completed wave, notify
-                # front-end that we need to start the next one.
+                # The front-end's wave and running-state notifications arrive
+                # independently. Always wake a locally paused engine after an
+                # ADD, even when the request already carries the current wave.
                 self.engines_running = True
                 self.output_queue.put_nowait(
                     (-1, EngineCoreOutputs(start_wave=self.current_wave))
@@ -2031,6 +2049,14 @@ class DPEngineCoreProc(EngineCoreProc):
             # Publish request counts before and after GPU step to ensure freshness.
             self._maybe_publish_request_counts()
 
+            # Do not condition correctness on every rank owning real work.
+            # START_DP_WAVE wakes idle ranks, and the model runner's existing
+            # DP batch coordination gives every rank the same padded launch
+            # descriptor; ranks with no requests execute a dummy batch. A
+            # conditional admission collective here can deadlock when a new
+            # request arrives while peers are finishing the prior wave, and a
+            # timeout-based wait penalizes legitimate sparse tail waves.
+
             if self.eep_scaling_state is not None:
                 _ = self.eep_scaling_state.progress()
                 if self.eep_scaling_state.is_complete():
@@ -2087,16 +2113,39 @@ class DPEngineCoreProc(EngineCoreProc):
         raise SystemExit
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
+        # Generic MoE amortizes finish synchronization over 32 steps. MegaMoE
+        # uses one EP collective body per model step, so keeping an empty wave
+        # alive creates expensive dummy passes and can split a rank-pinned
+        # batch across adjacent steps.
         self.step_counter += 1
-        if self.step_counter % 32 != 0:
+        if self.step_counter % self.finish_sync_interval != 0:
             return True
 
+        sync_started_ns = time.perf_counter_ns()
         has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
             self.dp_group,
             has_unfinished=local_unfinished,
             pending_pause=self.pending_pause,
         )
+        if self.profile_megamoe_finish_sync:
+            sync_ns = time.perf_counter_ns() - sync_started_ns
+            self.finish_sync_calls += 1
+            self.finish_sync_total_ns += sync_ns
+            self.finish_sync_max_ns = max(self.finish_sync_max_ns, sync_ns)
+            if not has_unfinished:
+                logger.info(
+                    "MegaMoE completion sync: rank=%d wave=%d calls=%d "
+                    "total_us=%.3f mean_us=%.3f max_us=%.3f",
+                    self.dp_rank,
+                    self.current_wave,
+                    self.finish_sync_calls,
+                    self.finish_sync_total_ns / 1e3,
+                    self.finish_sync_total_ns / self.finish_sync_calls / 1e3,
+                    self.finish_sync_max_ns / 1e3,
+                )
+                self.finish_sync_calls = 0
+                self.finish_sync_total_ns = 0
+                self.finish_sync_max_ns = 0
 
         if pause_consensus:
             self.ignore_start_dp_wave = True

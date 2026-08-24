@@ -9,6 +9,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm
     triton_scaled_mm,
 )
 from vllm.model_executor.layers.quantization.utils import replace_parameter
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _upcast_e8m0_to_fp32,
+)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     convert_to_channelwise,
 )
@@ -162,6 +165,22 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
             return False, "only CUDA-alike and XPU devices are supported."
         return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        scale_name = (
+            "weight_scale_inv"
+            if getattr(layer, "weight_scale_inv", None) is not None
+            else "weight_scale"
+        )
+        scale = getattr(layer, scale_name)
+        # Triton's argument binder cannot accept float8_e8m0fnu. Decode the
+        # checkpoint's exponent-only scales once here, rather than allocating
+        # and converting them on every GEMM call.
+        if scale.dtype == torch.float8_e8m0fnu:
+            replace_parameter(
+                layer, scale_name, _upcast_e8m0_to_fp32(scale).contiguous()
+            )
 
     def apply_block_scaled_mm(
         self,

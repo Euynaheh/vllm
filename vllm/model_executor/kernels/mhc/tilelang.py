@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _use_deep_gemm_mhc() -> bool:
+    """Allow wo_a-only experiments without also changing the MHC kernels."""
+    return os.getenv("VLLM_DSV4_MHC_USE_DEEP_GEMM", "1") == "1"
 
 
 def _torch_hc_prenorm_gemm(
@@ -164,7 +171,7 @@ def mhc_pre_tilelang(
 
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
-    use_deep_gemm = is_deep_gemm_supported()
+    use_deep_gemm = is_deep_gemm_supported() and _use_deep_gemm_mhc()
     if use_deep_gemm:
         # these numbers are from deepgemm kernel impl
         block_k = 64
@@ -348,7 +355,13 @@ def mhc_pre_broadcast_tilelang(
     residual_flat = residual
     num_tokens = residual.shape[0]
 
-    n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
+    # DeepGEMM advertises generic Blackwell support for SM120, but its TF32
+    # hyperconnection kernel only supports datacenter Blackwell architectures.
+    # Use the existing TileLang prenorm GEMM when DeepGEMM is disabled.
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+    use_deep_gemm = is_deep_gemm_supported() and _use_deep_gemm_mhc()
+    n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64)) if use_deep_gemm else 1
 
     residual_out = torch.empty(
         num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
@@ -369,15 +382,27 @@ def mhc_pre_broadcast_tilelang(
         n_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
 
-    from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
+    if use_deep_gemm:
+        from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
 
-    tf32_hc_prenorm_gemm(
-        residual_flat,
-        fn_broadcast,
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        n_splits,
-    )
+        tf32_hc_prenorm_gemm(
+            residual_flat,
+            fn_broadcast,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            n_splits,
+        )
+    else:
+        # fn_broadcast has already collapsed the identical initial HC streams,
+        # so this GEMM has one logical HC input rather than hc_mult inputs.
+        _tilelang_hc_prenorm_gemm(
+            residual_flat,
+            fn_broadcast,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hidden_size,
+            1,
+        )
     mhc_pre_big_fuse_broadcast_with_norm_tilelang(
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -514,7 +539,7 @@ def mhc_fused_post_pre_tilelang(
 
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
-    use_deep_gemm = is_deep_gemm_supported()
+    use_deep_gemm = is_deep_gemm_supported() and _use_deep_gemm_mhc()
     use_small_fma = num_tokens <= 16
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
