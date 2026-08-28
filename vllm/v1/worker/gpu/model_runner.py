@@ -78,6 +78,7 @@ from vllm.v1.worker.gpu.input_batch import (
     InputBuffers,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
+    get_num_sampled_and_rejected,
     post_update,
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
@@ -170,6 +171,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Data parallelism.
         self.dp_size = self.parallel_config.data_parallel_size
         self.dp_rank = self.parallel_config.data_parallel_rank
+        self.require_megamoe_ep_lockstep = (
+            vllm_config.kernel_config.moe_backend == "flashinfer_mega_moe"
+            and self.parallel_config.enable_expert_parallel
+            and self.dp_size > 1
+        )
 
         # Decode context parallelism.
         self.dcp_size = self.parallel_config.decode_context_parallel_size
@@ -535,6 +541,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         uniform_decode: bool = False,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        participate_dp_vocab: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -587,6 +594,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dummy_run=True,
                 skip_attn_for_dummy_run=skip_attn,
                 is_profile=is_profile,
+                participate_dp_vocab=participate_dp_vocab,
             )
         self.kv_connector.set_disabled(False)
 
@@ -1087,9 +1095,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
+        dp_vocab_logits: torch.Tensor | None = None,
+        dp_vocab_greedy: torch.Tensor | None = None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
-        sample_hidden_states = hidden_states[input_batch.logits_indices]
-        logits = self.model.compute_logits(sample_hidden_states)
+        dp_vocab_mode = getattr(self.model, "dp_vocab_lm_head_mode", None)
+        if dp_vocab_mode == "logits" and dp_vocab_logits is not None:
+            logits = dp_vocab_logits
+        elif dp_vocab_mode == "greedy" and dp_vocab_greedy is not None:
+            self._validate_dp_vocab_greedy(input_batch, grammar_output)
+            num_sampled, num_rejected = get_num_sampled_and_rejected(
+                input_batch.seq_lens.new_ones(input_batch.num_reqs),
+                input_batch.seq_lens,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                self.req_states.prefill_len.gpu,
+            )
+            sampler_output = SamplerOutput(
+                sampled_token_ids=dp_vocab_greedy.view(-1, 1),
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+            )
+            return sampler_output, num_sampled, num_rejected
+        else:
+            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
@@ -1115,6 +1146,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+
+    def _validate_dp_vocab_greedy(
+        self,
+        input_batch: InputBatch,
+        grammar_output: GrammarOutput | None,
+    ) -> None:
+        assert self.sampler is not None
+        idx_mapping_np = input_batch.idx_mapping_np
+        unsupported = []
+        if grammar_output is not None:
+            unsupported.append("structured output grammar")
+        if input_batch.num_draft_tokens != 0:
+            unsupported.append("speculative decoding")
+        if not np.all(
+            self.sampler.sampling_states.temperature.np[idx_mapping_np] == 0.0
+        ):
+            unsupported.append("non-greedy sampling")
+        if self.sampler.returns_logprobs(idx_mapping_np):
+            unsupported.append("requested logprobs")
+        if np.any(self.sampler.penalties_state.use_penalty[idx_mapping_np]):
+            unsupported.append("sampling penalties")
+        if np.any(self.sampler.logit_bias_state.use_logit_bias[idx_mapping_np]):
+            unsupported.append("logit bias or allowed tokens")
+        if np.any(self.sampler.bad_words_state.num_bad_words.np[idx_mapping_np] != 0):
+            unsupported.append("bad words")
+        if unsupported:
+            raise RuntimeError(
+                "VLLM_SM120_DP_VOCAB_LM_HEAD=greedy cannot preserve the "
+                "requested sampling semantics: " + ", ".join(unsupported)
+            )
 
     def postprocess_sampled(
         self,
@@ -1155,6 +1216,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
+        participate_dp_vocab: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
@@ -1198,6 +1260,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
+            require_rank_lockstep=self.require_megamoe_ep_lockstep,
         )
 
         if batch_desc.num_tokens == 0:
@@ -1375,6 +1438,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
+        dp_vocab_logits = None
+        dp_vocab_greedy = None
+        dp_vocab_mode = getattr(self.model, "dp_vocab_lm_head_mode", None)
+        is_kernel_warmup = bool(input_batch.req_ids) and all(
+            req_id.startswith("_warmup_") for req_id in input_batch.req_ids
+        )
+        if (
+            self.is_last_pp_rank
+            and dp_vocab_mode is not None
+            and (not dummy_run or participate_dp_vocab)
+            and not is_kernel_warmup
+        ):
+            assert hidden_states is not None
+            if dp_vocab_mode == "logits":
+                sample_hidden_states = (
+                    hidden_states[:0]
+                    if dummy_run
+                    else hidden_states[input_batch.logits_indices]
+                )
+                dp_vocab_logits = self.model.compute_dp_vocab_logits(
+                    sample_hidden_states, input_batch.num_tokens_after_padding
+                )
+            else:
+                assert dp_vocab_mode == "greedy"
+                if not dummy_run:
+                    self._validate_dp_vocab_greedy(input_batch, None)
+                dp_vocab_greedy = self.model.compute_dp_vocab_greedy(
+                    hidden_states[:0] if dummy_run else hidden_states,
+                    input_batch.num_tokens_after_padding,
+                    None if dummy_run else input_batch.logits_indices,
+                )
+
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
@@ -1383,6 +1478,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            dp_vocab_logits=dp_vocab_logits,
+            dp_vocab_greedy=dp_vocab_greedy,
         )
 
         if not self.is_last_pp_rank:
@@ -1405,6 +1502,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        dp_vocab_logits = self.execute_model_state.dp_vocab_logits
+        dp_vocab_greedy = self.execute_model_state.dp_vocab_greedy
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1431,7 +1530,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
+            hidden_states,
+            input_batch,
+            grammar_output,
+            dp_vocab_logits,
+            dp_vocab_greedy,
         )
 
         if self.pp_handler is not None:
@@ -1647,6 +1750,8 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    dp_vocab_logits: torch.Tensor | None
+    dp_vocab_greedy: torch.Tensor | None
 
 
 def sort_batch_req_ids(

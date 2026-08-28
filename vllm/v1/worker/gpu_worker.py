@@ -779,6 +779,29 @@ class Worker(WorkerBase):
         # cuda graph capture.
         kernel_warmup(self)
 
+        dp_vocab_buckets = os.getenv(
+            "VLLM_SM120_DP_VOCAB_WARMUP_BUCKETS", ""
+        ).strip()
+        if dp_vocab_buckets:
+            model = self.model_runner.get_model()
+            warm_up_dp_vocab = getattr(model, "warm_up_dp_vocab_lm_head", None)
+            if warm_up_dp_vocab is not None:
+                buckets = sorted(
+                    {int(value) for value in dp_vocab_buckets.split(",")},
+                    reverse=True,
+                )
+                if not buckets or buckets[-1] <= 0:
+                    raise ValueError(
+                        "VLLM_SM120_DP_VOCAB_WARMUP_BUCKETS must contain "
+                        "positive comma-separated integers"
+                    )
+                for bucket_rows in buckets:
+                    logger.info(
+                        "Warming up DP-vocab LM head for %d rows",
+                        bucket_rows,
+                    )
+                    warm_up_dp_vocab(bucket_rows)
+
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
@@ -1232,7 +1255,14 @@ class Worker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+        self.model_runner._dummy_run(
+            num_tokens,
+            uniform_decode=True,
+            participate_dp_vocab=True,
+        )
+
+    def complete_dummy_dp_vocab_step(self) -> None:
+        """Match a real rank's sample_tokens worker-command slot."""
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

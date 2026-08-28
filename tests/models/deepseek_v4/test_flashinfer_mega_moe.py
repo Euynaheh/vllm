@@ -33,9 +33,16 @@ class _FakeLayer(nn.Module):
             max_tokens, hidden_size, dtype=torch.bfloat16
         )
         self._staged: _Envelope | None = None
+        self.compile_tokens_per_rank: int | None = None
 
-    def stage_inputs(self, tensors: _Envelope) -> None:
+    def stage_inputs(
+        self,
+        tensors: _Envelope,
+        *,
+        compile_tokens_per_rank: int | None = None,
+    ) -> None:
         self._staged = tensors
+        self.compile_tokens_per_rank = compile_tokens_per_rank
 
     def compute_staged(self, *, output: torch.Tensor) -> torch.Tensor:
         assert self._staged is not None
@@ -107,6 +114,7 @@ def test_flashinfer_mega_moe_adapter_contract(monkeypatch: pytest.MonkeyPatch) -
     torch.testing.assert_close(output, hidden + 1)
     assert output.data_ptr() == adapter.output_buffer.data_ptr()
     assert adapter._fast_tensors is not None
+    assert adapter.layer.compile_tokens_per_rank == hidden.shape[0]
     assert is_mega_moe_backend("flashinfer_mega_moe")
 
 
@@ -175,7 +183,7 @@ def test_flashinfer_mega_moe_adapter_cuda_graph(
         top_k=top_k,
         hidden_size=hidden,
         intermediate_size=intermediate,
-        max_num_tokens=80,
+        max_num_tokens=8192,
         activation_clamp=None,
     ).cuda()
     adapter.finalize_weights(w13, w2, w13_scale, w2_scale)

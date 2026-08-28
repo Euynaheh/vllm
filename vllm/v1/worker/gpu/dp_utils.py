@@ -22,6 +22,7 @@ def sync_cudagraph_and_dp_padding(
     dp_size: int,
     dp_rank: int,
     num_active_loras: int = 0,
+    require_rank_lockstep: bool = False,
 ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
     """
     Coordinates the batch descriptor and DP padding across all ranks.
@@ -48,7 +49,10 @@ def sync_cudagraph_and_dp_padding(
 
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min().item()))
 
-    # If any rank wants to run eager, all ranks run eager
+    # Eager attention must keep each DP rank at its local token count.  A
+    # collective MoE backend can still use num_tokens_across_dp to select one
+    # common inner-kernel bucket without making idle ranks execute a full
+    # padded attention batch.
     if synced_cg_mode == CUDAGraphMode.NONE:
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
@@ -57,11 +61,11 @@ def sync_cudagraph_and_dp_padding(
             num_active_loras=desired_batch_desc.num_active_loras,
         ), num_tokens_across_dp
 
+    synced_num_tokens = int(num_tokens_across_dp.max().item())
     assert cudagraph_manager is not None, (
         "cudagraph_manager should only be None during profile run, "
         "where synced_cg_mode must be NONE across all DP ranks"
     )
-    synced_num_tokens = int(num_tokens_across_dp.max().item())
     synced_uniform_token_count = uniform_token_counts_across_dp[0]
     # If ranks disagree on the uniform token count, or its 0 (means None) set to None
     if synced_uniform_token_count == 0 or not torch.all(
@@ -94,6 +98,7 @@ def dispatch_cg_and_sync_dp(
     dp_rank: int,
     need_eager: bool = False,
     num_active_loras: int = 0,
+    require_rank_lockstep: bool = False,
 ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
     if need_eager:
         batch_desc = BatchExecutionDescriptor(
@@ -126,4 +131,5 @@ def dispatch_cg_and_sync_dp(
         dp_size,
         dp_rank,
         num_active_loras=num_active_loras,
+        require_rank_lockstep=require_rank_lockstep,
     )

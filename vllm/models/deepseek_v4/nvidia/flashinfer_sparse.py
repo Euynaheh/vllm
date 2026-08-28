@@ -867,6 +867,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
+            # Piecewise CUDA Graph padding can leave a DP rank with a
+            # metadata-only prefill chunk. FlashInfer sparse MLA does not
+            # accept zero-token batches, and there is no output work to do.
+            if query_start == query_end:
+                continue
+
             extra_sparse_indices_chunk = (
                 extra_sparse_indices[query_start:query_end]
                 if extra_sparse_indices is not None

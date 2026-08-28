@@ -75,6 +75,9 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
 )
+from vllm.models.deepseek_v4.nvidia.dp_vocab_lm_head import (
+    DPVocabParallelLMHead,
+)
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
@@ -1538,6 +1541,7 @@ class DeepseekV4ForCausalLM(
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.dp_vocab_lm_head = DPVocabParallelLMHead.from_environment()
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
@@ -1572,6 +1576,59 @@ class DeepseekV4ForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    @property
+    def dp_vocab_lm_head_mode(self) -> str | None:
+        if self.dp_vocab_lm_head is None:
+            return None
+        return self.dp_vocab_lm_head.mode
+
+    def compute_dp_vocab_logits(
+        self,
+        hidden_states: torch.Tensor,
+        bucket_rows: int,
+    ) -> torch.Tensor:
+        assert self.dp_vocab_lm_head is not None
+        logits = self.dp_vocab_lm_head.compute_logits(
+            self.lm_head,
+            hidden_states,
+            bucket_rows,
+            self.logits_processor.org_vocab_size,
+        )
+        if self.logits_processor.soft_cap is not None:
+            soft_cap = self.logits_processor.soft_cap
+            logits = torch.tanh(logits / soft_cap) * soft_cap
+        if self.logits_processor.scale != 1.0:
+            logits *= self.logits_processor.scale
+        return logits
+
+    def compute_dp_vocab_greedy(
+        self,
+        hidden_states: torch.Tensor,
+        bucket_rows: int,
+        source_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert self.dp_vocab_lm_head is not None
+        if self.logits_processor.scale <= 0.0:
+            raise ValueError("DP-vocab greedy requires a positive logits scale")
+        return self.dp_vocab_lm_head.compute_greedy(
+            self.lm_head,
+            hidden_states,
+            bucket_rows,
+            self.logits_processor.org_vocab_size,
+            source_indices,
+        )
+
+    def warm_up_dp_vocab_lm_head(self, bucket_rows: int) -> None:
+        if self.dp_vocab_lm_head is None:
+            return
+        hidden_states = self.lm_head.weight.new_zeros(
+            (bucket_rows, self.lm_head.weight.shape[1])
+        )
+        if self.dp_vocab_lm_head.mode == "greedy":
+            self.compute_dp_vocab_greedy(hidden_states, bucket_rows)
+        else:
+            self.compute_dp_vocab_logits(hidden_states, bucket_rows)
 
     def forward(
         self,
