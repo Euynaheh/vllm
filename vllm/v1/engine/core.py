@@ -1936,6 +1936,11 @@ class DPEngineCoreProc(EngineCoreProc):
             and parallel_config.enable_expert_parallel
             and parallel_config.data_parallel_size > 1
         )
+        self.dp_vocab_sample_command_parity = (
+            self.require_megamoe_ep_lockstep
+            and os.getenv("VLLM_SM120_DP_VOCAB_LM_HEAD", "").strip().lower()
+            in {"greedy", "logits"}
+        )
         self.finish_sync_interval = (
             1 if self.require_megamoe_ep_lockstep else 32
         )
@@ -1976,6 +1981,14 @@ class DPEngineCoreProc(EngineCoreProc):
             engine_index=dp_rank,
             tensor_queue=tensor_queue,
         )
+
+    def execute_dummy_batch(self):
+        super().execute_dummy_batch()
+        if self.dp_vocab_sample_command_parity:
+            # Real ranks enqueue execute_model followed by sample_tokens. Give
+            # idle ranks the same two-command cadence so their next dummy
+            # execute cannot enter a DP collective ahead of peer sampling.
+            self.collective_rpc("complete_dummy_dp_vocab_step")
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.

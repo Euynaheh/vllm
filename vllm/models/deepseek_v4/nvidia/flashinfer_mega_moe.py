@@ -205,7 +205,18 @@ class DeepseekV4FlashInferMegaMoEAdapter(nn.Module):
                 f"{self.activation_clamp} -> {activation_clamp}"
             )
         tensors = self._bind_tensors(hidden_states, topk_weights, topk_ids, output)
-        self.layer.stage_inputs(tensors)
+        compile_tokens_per_rank = hidden_states.shape[0]
+        forward_context = get_forward_context()
+        if forward_context.dp_metadata is not None:
+            compile_tokens_per_rank = int(
+                forward_context.dp_metadata.num_tokens_across_dp_cpu.max().item()
+            )
+        # Keep attention and staging at the local row count, but make every EP
+        # rank select the same inner MegaMoE graph.  This is required for eager
+        # prefill tail waves where some DP ranks only execute a one-row dummy.
+        self.layer.stage_inputs(
+            tensors, compile_tokens_per_rank=compile_tokens_per_rank
+        )
 
     def compute_staged_into(self, output: torch.Tensor) -> None:
         if self.layer is None:
